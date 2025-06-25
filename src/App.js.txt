@@ -1,0 +1,391 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+    getAuth, 
+    signInAnonymously, 
+    onAuthStateChanged,
+    signInWithCustomToken
+} from 'firebase/auth';
+import { 
+    getFirestore, 
+    doc, 
+    setDoc, 
+    addDoc, 
+    collection, 
+    query, 
+    where, 
+    onSnapshot, 
+    orderBy, 
+    serverTimestamp,
+    getDoc
+} from 'firebase/firestore';
+import { ArrowLeft, Send, Copy, UserPlus } from 'lucide-react';
+
+// --- Firebase Configuration ---
+// 這會從環境中自動載入，請勿修改。
+const firebaseConfig = typeof __firebase_config !== 'undefined' 
+    ? JSON.parse(__firebase_config) 
+    : {};
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-chat-app';
+
+// --- 主應用程式組件 ---
+export default function App() {
+    // --- 狀態管理 ---
+    const [user, setUser] = useState(null); // 目前已認證的使用者
+    const [isAuthReady, setIsAuthReady] = useState(false); // 追蹤認證狀態是否就緒
+    const [currentScreen, setCurrentScreen] = useState('chatList'); // 'chatList' 或 'chatRoom'
+    const [chats, setChats] = useState([]); // 使用者的聊天列表
+    const [selectedChat, setSelectedChat] = useState(null); // 目前選擇的聊天對象
+    const [messages, setMessages] = useState([]); // 目前聊天室的訊息
+    const [newMessage, setNewMessage] = useState(''); // 新訊息的輸入欄位
+    const [newFriendId, setNewFriendId] = useState(''); // 新增朋友的 ID 輸入欄位
+    const [error, setError] = useState(''); // 顯示錯誤訊息
+    const [isCopied, setIsCopied] = useState(false); // 追蹤使用者 ID 是否已複製
+
+    // --- Firebase 實例 ---
+    const [firebaseApp, setFirebaseApp] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [db, setDb] = useState(null);
+    
+    const messagesEndRef = useRef(null); // 用於自動滾動到最新訊息
+
+    // --- 初始化 Firebase ---
+    useEffect(() => {
+        if (Object.keys(firebaseConfig).length > 0) {
+            const app = initializeApp(firebaseConfig);
+            const authInstance = getAuth(app);
+            const dbInstance = getFirestore(app);
+            setFirebaseApp(app);
+            setAuth(authInstance);
+            setDb(dbInstance);
+
+            const unsubscribe = onAuthStateChanged(authInstance, async (user) => {
+                if (user) {
+                    setUser(user);
+                } else {
+                    try {
+                        // 如果有提供自訂令牌，就使用它登入，否則匿名登入
+                        const token = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+                        if (token) {
+                            await signInWithCustomToken(authInstance, token);
+                        } else {
+                            await signInAnonymously(authInstance);
+                        }
+                    } catch (err) {
+                        console.error("認證錯誤:", err);
+                        setError("無法匿名登入，請刷新頁面重試。");
+                    }
+                }
+                setIsAuthReady(true);
+            });
+            return () => unsubscribe();
+        }
+    }, []);
+
+    // --- 訂閱使用者的聊天列表 ---
+    useEffect(() => {
+        if (isAuthReady && user && db) {
+            const chatsCollectionPath = `/artifacts/${appId}/public/data/chats`;
+            const q = query(collection(db, chatsCollectionPath), where('users', 'array-contains', user.uid));
+            
+            const unsubscribe = onSnapshot(q, (querySnapshot) => {
+                const userChats = querySnapshot.docs.map(doc => ({
+                    id: doc.id,
+                    ...doc.data()
+                }));
+                // 為了避免每次排序都不同，我們先在記憶體中排序
+                const sortedChats = userChats.sort((a, b) => {
+                    const timeA = a.lastMessage?.timestamp?.toMillis() || 0;
+                    const timeB = b.lastMessage?.timestamp?.toMillis() || 0;
+                    return timeB - timeA;
+                });
+                setChats(sortedChats);
+            }, (err) => {
+                console.error("獲取聊天列表錯誤:", err);
+                setError("無法載入您的聊天列表。");
+            });
+
+            return () => unsubscribe();
+        }
+    }, [isAuthReady, user, db]);
+
+    // --- 訂閱所選聊天的訊息 ---
+    useEffect(() => {
+        if (selectedChat && db) {
+            const messagesCollectionPath = `/artifacts/${appId}/public/data/chats/${selectedChat.id}/messages`;
+            const q = query(collection(db, messagesCollectionPath), orderBy('timestamp', 'asc'));
+
+            const unsubscribe = onSnapshot(q, (querySnapshot) => {
+                const chatMessages = querySnapshot.docs.map(doc => ({
+                    id: doc.id,
+                    ...doc.data()
+                }));
+                setMessages(chatMessages);
+            }, (err) => {
+                console.error("獲取訊息錯誤:", err);
+                setError("無法載入訊息。");
+            });
+
+            return () => unsubscribe();
+        }
+    }, [selectedChat, db]);
+    
+    // --- 自動滾動到最新訊息 ---
+    useEffect(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }, [messages]);
+
+    // --- 處理函式 ---
+
+    /**
+     * 新增朋友並開始新聊天
+     */
+    const handleAddFriend = async () => {
+        if (!newFriendId.trim() || !user || !db) return;
+        if (newFriendId.trim() === user.uid) {
+            setError("您不能將自己新增為朋友！");
+            setTimeout(() => setError(''), 3000);
+            return;
+        }
+
+        setError('');
+        
+        // 檢查使用者是否存在（可選，但建議）
+        // 為了簡單起見，我們假設如果使用者輸入了 ID，該使用者就存在。
+        
+        const friendId = newFriendId.trim();
+        const uids = [user.uid, friendId].sort();
+        const chatId = uids.join('_');
+        
+        const chatDocPath = `/artifacts/${appId}/public/data/chats/${chatId}`;
+        const chatDocRef = doc(db, chatDocPath);
+
+        try {
+            const chatDoc = await getDoc(chatDocRef);
+            if (!chatDoc.exists()) {
+                await setDoc(chatDocRef, {
+                    users: uids,
+                    createdBy: user.uid,
+                    createdAt: serverTimestamp(),
+                });
+            }
+            
+            // 找到或建立聊天後，選擇它
+            const otherUserId = uids.find(uid => uid !== user.uid);
+            setSelectedChat({ id: chatId, otherUserId });
+            setCurrentScreen('chatRoom');
+            setNewFriendId('');
+
+        } catch (err) {
+            console.error("新增朋友錯誤:", err);
+            setError("無法開始新的聊天。請檢查 ID 是否正確。");
+            setTimeout(() => setError(''), 3000);
+        }
+    };
+
+    /**
+     * 發送新訊息
+     */
+    const handleSendMessage = async (e) => {
+        e.preventDefault();
+        if (!newMessage.trim() || !user || !selectedChat || !db) return;
+
+        const messageText = newMessage.trim();
+        setNewMessage('');
+
+        const messagesCollectionPath = `/artifacts/${appId}/public/data/chats/${selectedChat.id}/messages`;
+        const chatDocPath = `/artifacts/${appId}/public/data/chats/${selectedChat.id}`;
+
+        try {
+            // 在 messages 子集合中新增訊息
+            await addDoc(collection(db, messagesCollectionPath), {
+                text: messageText,
+                senderId: user.uid,
+                timestamp: serverTimestamp(),
+            });
+            
+            // 更新聊天文件的最後一則訊息以供排序
+            const chatDocRef = doc(db, chatDocPath);
+            await setDoc(chatDocRef, { 
+                lastMessage: {
+                    text: messageText,
+                    timestamp: serverTimestamp()
+                }
+            }, { merge: true });
+
+        } catch (err) {
+            console.error("發送訊息錯誤:", err);
+            setError("無法發送訊息。");
+            setNewMessage(messageText); // 將未發送的訊息放回輸入框
+        }
+    };
+
+    /**
+     * 選擇一個聊天進入聊天室
+     */
+    const selectChat = (chat) => {
+        const otherUserId = chat.users.find(uid => uid !== user.uid);
+        setSelectedChat({ id: chat.id, otherUserId });
+        setCurrentScreen('chatRoom');
+    };
+
+    /**
+     * 返回聊天列表
+     */
+    const backToChatList = () => {
+        setCurrentScreen('chatList');
+        setSelectedChat(null);
+        setMessages([]);
+        setError('');
+    };
+
+    /**
+     * 複製使用者 ID 到剪貼簿
+     */
+    const copyUserId = () => {
+        if (user?.uid) {
+            const dummy = document.createElement("textarea");
+            document.body.appendChild(dummy);
+            dummy.value = user.uid;
+            dummy.select();
+            document.execCommand("copy");
+            document.body.removeChild(dummy);
+            setIsCopied(true);
+            setTimeout(() => setIsCopied(false), 2000);
+        }
+    };
+
+    // --- 渲染組件 ---
+
+    // 讀取畫面
+    if (!isAuthReady || !user) {
+        return (
+            <div className="flex items-center justify-center h-screen bg-gray-900 text-white">
+                <div className="flex flex-col items-center">
+                    <div className="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-blue-500"></div>
+                    <p className="mt-4 text-lg">正在連接安全伺服器...</p>
+                </div>
+            </div>
+        );
+    }
+    
+    // UI 主體
+    return (
+        <div className="h-screen w-full flex flex-col font-sans bg-gray-900 text-white antialiased">
+            {/* 錯誤提示 */}
+            {error && <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-red-500 text-white px-4 py-2 rounded-lg shadow-lg z-50">{error}</div>}
+
+            {/* --- 聊天列表畫面 --- */}
+            {currentScreen === 'chatList' && (
+                <>
+                    {/* 標頭 */}
+                    <header className="bg-gray-800 p-4 shadow-md z-10">
+                        <h1 className="text-xl font-bold text-center">私人聊天</h1>
+                        <div className="mt-4 p-3 bg-gray-700 rounded-lg">
+                            <p className="text-xs text-gray-400 mb-1">分享您的專屬 ID 開始聊天：</p>
+                            <div className="flex items-center justify-between">
+                                <span className="text-sm font-mono truncate mr-2">{user.uid}</span>
+                                <button onClick={copyUserId} className="p-2 bg-blue-600 hover:bg-blue-700 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all duration-200">
+                                    {isCopied ? <span className="text-xs">已複製!</span> : <Copy size={16} />}
+                                </button>
+                            </div>
+                        </div>
+                    </header>
+
+                    {/* 新增朋友 */}
+                    <div className="p-4 bg-gray-800 border-t border-gray-700">
+                        <div className="flex space-x-2">
+                            <input
+                                type="text"
+                                value={newFriendId}
+                                onChange={(e) => setNewFriendId(e.target.value)}
+                                placeholder="輸入朋友的 ID"
+                                className="flex-grow bg-gray-700 rounded-lg p-3 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            <button onClick={handleAddFriend} className="bg-green-600 hover:bg-green-700 p-3 rounded-lg flex items-center justify-center focus:outline-none focus:ring-2 focus:ring-green-500 transition-colors">
+                                <UserPlus size={20} />
+                            </button>
+                        </div>
+                    </div>
+                    
+                    {/* 聊天列表 */}
+                    <main className="flex-1 overflow-y-auto">
+                        {chats.length > 0 ? (
+                            <ul className="divide-y divide-gray-700">
+                                {chats.map(chat => {
+                                    const otherUserId = chat.users.find(uid => uid !== user.uid);
+                                    return (
+                                        <li key={chat.id} onClick={() => selectChat(chat)} className="p-4 hover:bg-gray-800 cursor-pointer transition-colors">
+                                            <div className="flex items-center">
+                                                <div className="w-12 h-12 bg-blue-600 rounded-full flex items-center justify-center font-bold text-lg mr-4">
+                                                    {otherUserId.substring(0, 2).toUpperCase()}
+                                                </div>
+                                                <div className="flex-1">
+                                                    <p className="font-semibold truncate">{otherUserId}</p>
+                                                    <p className="text-sm text-gray-400 truncate">
+                                                        {chat.lastMessage?.text || "點此開始聊天"}
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        </li>
+                                    );
+                                })}
+                            </ul>
+                        ) : (
+                            <div className="text-center p-8 text-gray-500">
+                                <p>還沒有聊天。</p>
+                                <p>輸入朋友的 ID 開始對話吧！</p>
+                            </div>
+                        )}
+                    </main>
+                </>
+            )}
+
+            {/* --- 聊天室畫面 --- */}
+            {currentScreen === 'chatRoom' && selectedChat && (
+                <>
+                    {/* 標頭 */}
+                    <header className="bg-gray-800 p-4 flex items-center shadow-md z-10">
+                        <button onClick={backToChatList} className="mr-4 p-2 hover:bg-gray-700 rounded-full transition-colors">
+                            <ArrowLeft size={24} />
+                        </button>
+                        <div className="w-10 h-10 bg-blue-600 rounded-full flex items-center justify-center font-bold text-md mr-3">
+                            {selectedChat.otherUserId.substring(0, 2).toUpperCase()}
+                        </div>
+                        <h2 className="font-bold text-lg truncate">{selectedChat.otherUserId}</h2>
+                    </header>
+                    
+                    {/* 訊息區域 */}
+                    <main className="flex-1 overflow-y-auto p-4 bg-gray-900">
+                        <div className="space-y-4">
+                            {messages.map((msg, index) => (
+                                <div key={msg.id} className={`flex ${msg.senderId === user.uid ? 'justify-end' : 'justify-start'}`}>
+                                    <div className={`max-w-xs md:max-w-md p-3 rounded-2xl ${msg.senderId === user.uid ? 'bg-blue-600 rounded-br-lg' : 'bg-gray-700 rounded-bl-lg'}`}>
+                                        <p className="text-white break-words">{msg.text}</p>
+                                    </div>
+                                </div>
+                            ))}
+                            <div ref={messagesEndRef} />
+                        </div>
+                    </main>
+                    
+                    {/* 輸入框 */}
+                    <footer className="p-4 bg-gray-800 border-t border-gray-700">
+                        <form onSubmit={handleSendMessage} className="flex items-center space-x-2">
+                            <input
+                                type="text"
+                                value={newMessage}
+                                onChange={(e) => setNewMessage(e.target.value)}
+                                placeholder="輸入訊息..."
+                                className="flex-grow bg-gray-700 rounded-full py-3 px-4 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            <button type="submit" className="bg-blue-600 hover:bg-blue-700 text-white p-3 rounded-full flex items-center justify-center focus:outline-none focus:ring-2 focus:ring-blue-500 transition-colors">
+                                <Send size={24} />
+                            </button>
+                        </form>
+                    </footer>
+                </>
+            )}
+        </div>
+    );
+}
